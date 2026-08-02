@@ -203,7 +203,10 @@ jobs:
           mkdir -p "$STAGE"
           ARCHIVE="$STAGE/Buzz_${VERSION}_${EXPECTED_SHA}_unsigned.zip"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE"
-          shasum -a 256 "$ARCHIVE" > "$STAGE/SHA256SUMS.txt"
+          (
+            cd "$STAGE"
+            shasum -a 256 "$(basename "$ARCHIVE")" > SHA256SUMS.txt
+          )
           {
             echo "repository=$GITHUB_REPOSITORY"
             echo "ref=$GITHUB_REF"
