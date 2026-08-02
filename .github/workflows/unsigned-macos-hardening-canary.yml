@@ -115,7 +115,7 @@ jobs:
 
           config = {
               "productName": "Buzz Hardening Canary",
-              "identifier": "link.kensick.buzz.hardeningcanary",
+              "identifier": "xyz.block.buzz.app.dev.hardeningcanary",
               "bundle": {
                   "macOS": {"minimumSystemVersion": "10.15"},
                   "createUpdaterArtifacts": False,
@@ -211,7 +211,7 @@ jobs:
             echo "expected_sha=$EXPECTED_SHA"
             echo "version=$VERSION"
             echo "product_name=Buzz Hardening Canary"
-            echo "bundle_identifier=link.kensick.buzz.hardeningcanary"
+            echo "bundle_identifier=xyz.block.buzz.app.dev.hardeningcanary"
             echo "signed=false"
             echo "notarized=false"
             echo "installed_app_replaced=false"
