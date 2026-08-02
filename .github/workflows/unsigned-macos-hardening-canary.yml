@@ -114,6 +114,8 @@ jobs:
           from pathlib import Path
 
           config = {
+              "productName": "Buzz Hardening Canary",
+              "identifier": "link.kensick.buzz.hardeningcanary",
               "bundle": {
                   "macOS": {"minimumSystemVersion": "10.15"},
                   "createUpdaterArtifacts": False,
@@ -188,9 +190,9 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          APP=$(find desktop/src-tauri/target/release/bundle/macos -name 'Buzz.app' -type d | head -1)
+          APP=$(find desktop/src-tauri/target/release/bundle/macos -name 'Buzz Hardening Canary.app' -type d | head -1)
           if [[ -z "$APP" ]]; then
-            echo "::error::No Buzz.app bundle found"
+            echo "::error::No isolated Buzz Hardening Canary.app bundle found"
             exit 1
           fi
           if codesign -dv --verbose=4 "$APP" 2>&1 | grep -q 'Authority=Developer ID'; then
@@ -208,6 +210,8 @@ jobs:
             echo "sha=$GITHUB_SHA"
             echo "expected_sha=$EXPECTED_SHA"
             echo "version=$VERSION"
+            echo "product_name=Buzz Hardening Canary"
+            echo "bundle_identifier=link.kensick.buzz.hardeningcanary"
             echo "signed=false"
             echo "notarized=false"
             echo "installed_app_replaced=false"
