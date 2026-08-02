@@ -424,11 +424,15 @@ pub(crate) fn build_respond_to_env(
 pub(crate) fn configure_runtime_cli(
     command: &mut std::process::Command,
     runtime: Option<&KnownAcpRuntime>,
+    descriptor_has_claude_code_executable: bool,
 ) {
     let Some(runtime) = runtime else {
         return;
     };
     if runtime.id != "claude" {
+        return;
+    }
+    if descriptor_has_claude_code_executable {
         return;
     }
     if let Some(cli_path) = runtime.underlying_cli.and_then(resolve_command) {
@@ -860,7 +864,15 @@ pub fn spawn_agent_child(
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
-    configure_runtime_cli(&mut command, runtime_meta);
+    let descriptor_has_claude_code_executable = descriptor
+        .env
+        .iter()
+        .any(|(key, _)| key == "CLAUDE_CODE_EXECUTABLE");
+    configure_runtime_cli(
+        &mut command,
+        runtime_meta,
+        descriptor_has_claude_code_executable,
+    );
 
     // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible
     // transport at spawn time and scrub any unrelated ambient OpenAI key.

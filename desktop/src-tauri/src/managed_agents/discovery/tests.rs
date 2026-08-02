@@ -271,6 +271,40 @@ fn preset_entry_without_underlying_cli_stays_simple() {
     assert!(entry.underlying_cli_path.is_none());
 }
 
+fn preset_by_id(id: &str) -> &'static PresetHarness {
+    super::PRESET_HARNESSES
+        .iter()
+        .find(|preset| preset.id == id)
+        .expect("preset must exist")
+}
+
+#[test]
+fn kimi_preset_stays_native_subscription_first_acp() {
+    let kimi = preset_by_id("kimi");
+    assert_eq!(kimi.command, "kimi");
+    assert_eq!(kimi.args, &["acp"]);
+
+    let entry = preset_catalog_entry(kimi, |_| None);
+    assert_eq!(entry.default_args, vec!["acp".to_string()]);
+}
+
+#[test]
+fn grok_preset_preserves_stdio_without_approval_bypass() {
+    let grok = preset_by_id("grok");
+    assert_eq!(grok.command, "grok");
+    assert_eq!(grok.args, &["agent", "stdio"]);
+    assert!(
+        !grok.args.iter().any(|arg| arg.contains("approve")),
+        "Grok preset must not include unconditional approval-bypass args"
+    );
+
+    let entry = preset_catalog_entry(grok, |_| None);
+    assert_eq!(
+        entry.default_args,
+        vec!["agent".to_string(), "stdio".to_string()]
+    );
+}
+
 fn persona_with_runtime(id: &str, runtime: Option<&str>) -> crate::managed_agents::AgentDefinition {
     crate::managed_agents::AgentDefinition {
         id: id.to_string(),

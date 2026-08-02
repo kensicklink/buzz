@@ -78,6 +78,64 @@ impl StopReason {
     }
 }
 
+/// Human-visible completion details captured from a completed ACP prompt turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcpPromptCompletion {
+    /// Concatenated final assistant message chunks, if the agent streamed a
+    /// visible answer. Thought chunks and tool output are never recorded here.
+    pub final_answer: Option<String>,
+    /// True only after a `buzz messages send` tool call was correlated with a
+    /// successful terminal `tool_call_update` for the same `toolCallId`.
+    pub explicit_buzz_send_completed: bool,
+}
+
+#[derive(Debug, Default)]
+struct PromptTurnCapture {
+    assistant_message: String,
+    buzz_send_tool_call_ids: std::collections::HashSet<String>,
+    explicit_buzz_send_completed: bool,
+}
+
+impl PromptTurnCapture {
+    fn reset(&mut self) {
+        self.assistant_message.clear();
+        self.buzz_send_tool_call_ids.clear();
+        self.explicit_buzz_send_completed = false;
+    }
+
+    fn record_agent_message_chunk(&mut self, text: &str) {
+        self.assistant_message.push_str(text);
+    }
+
+    fn record_tool_call(&mut self, update: &serde_json::Value) {
+        let Some(tool_id) = tool_call_id(update) else {
+            return;
+        };
+        if tool_call_invokes_buzz_messages_send(update) {
+            self.buzz_send_tool_call_ids.insert(tool_id);
+        }
+    }
+
+    fn record_tool_call_update(&mut self, update: &serde_json::Value) {
+        let Some(tool_id) = tool_call_id(update) else {
+            return;
+        };
+        if self.buzz_send_tool_call_ids.contains(&tool_id)
+            && tool_call_update_completed_successfully(update)
+        {
+            self.explicit_buzz_send_completed = true;
+        }
+    }
+
+    fn snapshot(&self) -> AcpPromptCompletion {
+        let trimmed = self.assistant_message.trim();
+        AcpPromptCompletion {
+            final_answer: (!trimmed.is_empty()).then(|| trimmed.to_string()),
+            explicit_buzz_send_completed: self.explicit_buzz_send_completed,
+        }
+    }
+}
+
 /// Errors that can occur in the ACP client.
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
@@ -215,6 +273,8 @@ pub struct AcpClient {
     /// deltas. Both goose and buzz-agent emit this notification; goose gates
     /// on client capability advertisement, buzz-agent emits unconditionally.
     goose_usage: UsageTracker,
+    /// Per-turn visible completion and explicit send state.
+    prompt_turn_capture: PromptTurnCapture,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -564,6 +624,7 @@ impl AcpClient {
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
+            prompt_turn_capture: PromptTurnCapture::default(),
         })
     }
 
@@ -765,6 +826,7 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
+        self.prompt_turn_capture.reset();
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
         self.current_hard_deadline = Some(hard_deadline);
@@ -876,6 +938,14 @@ impl AcpClient {
     /// publish a kind 44200 NIP-AM event.
     pub fn take_turn_usage(&mut self) -> Option<TurnUsage> {
         self.goose_usage.take()
+    }
+
+    /// Consume the visible completion state captured from the most recent
+    /// prompt turn.
+    pub fn take_prompt_completion(&mut self) -> AcpPromptCompletion {
+        let completion = self.prompt_turn_capture.snapshot();
+        self.prompt_turn_capture.reset();
+        completion
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -1728,11 +1798,13 @@ impl AcpClient {
         match update_type {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
+                    self.prompt_turn_capture.record_agent_message_chunk(text);
                     tracing::info!(target: "acp::stream", "{text}");
                 }
                 false
             }
             "tool_call" => {
+                self.prompt_turn_capture.record_tool_call(update);
                 let title = update
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -1745,6 +1817,7 @@ impl AcpClient {
                 true
             }
             "tool_call_update" => {
+                self.prompt_turn_capture.record_tool_call_update(update);
                 let tool_id = update
                     .get("toolCallId")
                     .and_then(|v| v.as_str())
@@ -1968,6 +2041,117 @@ fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::
         "sessionId": session_id,
         "prompt": blocks,
     })
+}
+
+fn tool_call_id(update: &serde_json::Value) -> Option<String> {
+    for key in ["toolCallId", "tool_call_id", "id"] {
+        match update.get(key) {
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                return Some(value.clone());
+            }
+            Some(serde_json::Value::Number(value)) => return Some(value.to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn tool_call_invokes_buzz_messages_send(update: &serde_json::Value) -> bool {
+    ["title", "command", "name", "description"]
+        .into_iter()
+        .filter_map(|key| update.get(key).and_then(|value| value.as_str()))
+        .any(string_invokes_buzz_messages_send)
+        || ["input", "rawInput", "args", "content"]
+            .into_iter()
+            .filter_map(|key| update.get(key))
+            .any(value_invokes_buzz_messages_send)
+}
+
+fn value_invokes_buzz_messages_send(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => string_invokes_buzz_messages_send(text),
+        serde_json::Value::Array(values) => values.iter().any(value_invokes_buzz_messages_send),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .filter(|(key, _)| {
+                matches!(
+                    key.as_str(),
+                    "command" | "cmd" | "args" | "argv" | "text" | "input" | "rawInput"
+                )
+            })
+            .any(|(_, value)| value_invokes_buzz_messages_send(value)),
+        _ => false,
+    }
+}
+
+fn string_invokes_buzz_messages_send(text: &str) -> bool {
+    let tokens: Vec<&str> = text
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '"' | '\'' | '`' | '|' | ';' | '&' | '(' | ')' | '<' | '>'
+                )
+        })
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    for (idx, token) in tokens.iter().enumerate() {
+        if !is_buzz_cli_token(token) {
+            continue;
+        }
+        let mut saw_messages = false;
+        for next in tokens.iter().skip(idx + 1).take(8) {
+            let normalized = next.trim_matches(|c: char| matches!(c, ',' | ':' | '[' | ']'));
+            if normalized == "messages" {
+                saw_messages = true;
+            } else if saw_messages && normalized == "send" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_buzz_cli_token(token: &str) -> bool {
+    let token = token.trim_matches(|c: char| matches!(c, '"' | '\'' | '`'));
+    matches!(token, "buzz" | "buzz.exe")
+        || token.ends_with("/buzz")
+        || token.ends_with("\\buzz")
+        || token.ends_with("/buzz.exe")
+        || token.ends_with("\\buzz.exe")
+}
+
+fn tool_call_update_completed_successfully(update: &serde_json::Value) -> bool {
+    if update.get("success").and_then(|v| v.as_bool()) == Some(false) {
+        return false;
+    }
+    for key in ["exitCode", "exit_code", "code", "statusCode"] {
+        if let Some(value) = update.get(key) {
+            match value {
+                serde_json::Value::Number(number) => {
+                    if number.as_i64().is_some_and(|code| code != 0) {
+                        return false;
+                    }
+                }
+                serde_json::Value::String(code) => {
+                    if let Ok(code) = code.trim().parse::<i64>() {
+                        if code != 0 {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some(status) = update.get("status").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "completed" | "succeeded" | "success" | "finished" | "done"
+    )
 }
 
 /// Build `_goose/unstable/session/steer` params from one or more text
@@ -2472,6 +2656,20 @@ mod tests {
         assert_eq!(prompt[0]["text"].as_str(), Some("/goal ship it"));
         assert!(prompt[0]["text"].as_str().unwrap().starts_with('/'));
         assert_eq!(prompt[1]["type"].as_str(), Some("text"));
+    }
+
+    #[test]
+    fn completed_tool_update_with_nonzero_exit_is_not_successful() {
+        let update = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "send-1",
+            "status": "completed",
+            "exitCode": 1,
+        });
+        assert!(
+            !tool_call_update_completed_successfully(&update),
+            "a completed wrapper with nonzero exit code must not count as a successful Buzz send"
+        );
     }
 
     #[test]
@@ -3111,6 +3309,125 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap()["stopReason"].as_str(), Some("end_turn"));
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_captures_visible_answer_only() {
+        let script = r#"
+            read -r _prompt
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"hidden thought"}}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"other","status":"completed","content":{"text":"tool output"}}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Final "}}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"answer"}}}}'
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        let result = client
+            .session_prompt_with_idle_timeout(
+                "sess-test",
+                "prompt",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+        assert_eq!(result.unwrap(), StopReason::EndTurn);
+        let completion = client.take_prompt_completion();
+        assert_eq!(completion.final_answer.as_deref(), Some("Final answer"));
+        assert!(
+            !completion.explicit_buzz_send_completed,
+            "unrelated tool updates must not suppress fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_buzz_send_suppresses_fallback_before_relay_loopback() {
+        let script = r#"
+            read -r _prompt
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Visible answer"}}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"send-1","title":"buzz messages send --channel 11111111-1111-1111-1111-111111111111 --content -","kind":"shell"}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"send-1","status":"completed","exitCode":0}}}'
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        let result = client
+            .session_prompt_with_idle_timeout(
+                "sess-test",
+                "prompt",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+        assert_eq!(result.unwrap(), StopReason::EndTurn);
+        let completion = client.take_prompt_completion();
+        assert_eq!(completion.final_answer.as_deref(), Some("Visible answer"));
+        assert!(
+            completion.explicit_buzz_send_completed,
+            "completed tool_call_update must be enough even when no self relay echo arrived before result"
+        );
+    }
+
+    #[tokio::test]
+    async fn started_buzz_send_does_not_suppress_fallback() {
+        let script = r#"
+            read -r _prompt
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"send-1","title":"/usr/local/bin/buzz --format compact messages send --content -","kind":"shell"}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Fallback needed"}}}}'
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        let result = client
+            .session_prompt_with_idle_timeout(
+                "sess-test",
+                "prompt",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+        assert_eq!(result.unwrap(), StopReason::EndTurn);
+        let completion = client.take_prompt_completion();
+        assert_eq!(completion.final_answer.as_deref(), Some("Fallback needed"));
+        assert!(
+            !completion.explicit_buzz_send_completed,
+            "a merely-started Buzz send must not suppress fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_buzz_send_does_not_suppress_fallback() {
+        let script = r#"
+            read -r _prompt
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"send-1","title":"buzz messages send --content -","kind":"shell"}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"send-1","status":"failed","exitCode":1}}}'
+            echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Fallback after failed send"}}}}'
+            echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        let result = client
+            .session_prompt_with_idle_timeout(
+                "sess-test",
+                "prompt",
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+        assert_eq!(result.unwrap(), StopReason::EndTurn);
+        let completion = client.take_prompt_completion();
+        assert_eq!(
+            completion.final_answer.as_deref(),
+            Some("Fallback after failed send")
+        );
+        assert!(
+            !completion.explicit_buzz_send_completed,
+            "a failed Buzz send must not suppress fallback"
+        );
     }
 
     #[tokio::test]
