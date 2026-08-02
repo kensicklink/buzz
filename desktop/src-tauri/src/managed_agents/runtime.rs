@@ -8,8 +8,8 @@ use crate::{
     managed_agents::{
         append_log_marker, known_acp_runtime, login_shell_path, managed_agent_log_path,
         missing_command_message, normalize_agent_args, open_log_file, resolve_command,
-        spawn_key_refusal, KnownAcpRuntime, ManagedAgentPairRuntime, ManagedAgentRecord,
-        ManagedAgentRuntimeKey, ManagedAgentSummary,
+        spawn_key_refusal, ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey,
+        ManagedAgentSummary,
     },
     util::now_iso,
 };
@@ -17,8 +17,10 @@ use crate::{
 mod path;
 pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::compose_path_entries;
-pub(crate) use path::should_skip_claude_executable;
 pub(crate) use path::should_use_inherited;
+
+mod cli;
+pub(crate) use cli::configure_runtime_cli;
 
 mod metadata;
 pub(crate) use metadata::{
@@ -419,34 +421,6 @@ pub(crate) fn build_respond_to_env(
     }
 
     Ok((set, remove))
-}
-
-pub(crate) fn configure_runtime_cli(
-    command: &mut std::process::Command,
-    runtime: Option<&KnownAcpRuntime>,
-    descriptor_has_claude_code_executable: bool,
-) {
-    let Some(runtime) = runtime else {
-        return;
-    };
-    if runtime.id != "claude" {
-        return;
-    }
-    if descriptor_has_claude_code_executable {
-        return;
-    }
-    if let Some(cli_path) = runtime.underlying_cli.and_then(resolve_command) {
-        // On Windows, `.cmd` and `.bat` files are batch shims — they cannot be
-        // passed directly to `CreateProcess` and cause EINVAL when the Claude
-        // adapter tries to spawn them (issue #2397). Skip setting
-        // `CLAUDE_CODE_EXECUTABLE` for shim paths so the adapter falls back to
-        // its own PATH lookup and finds the real binary instead.
-        // Non-Windows: `.cmd`/`.bat` are valid executables and must be assigned.
-        if should_skip_claude_executable(&cli_path, cfg!(windows)) {
-            return;
-        }
-        command.env("CLAUDE_CODE_EXECUTABLE", cli_path);
-    }
 }
 
 /// Spawn an agent process without holding any locks on records or runtimes.
