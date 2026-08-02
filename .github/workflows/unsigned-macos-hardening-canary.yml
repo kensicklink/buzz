@@ -4,6 +4,9 @@ name: Fork-only unsigned macOS hardening canary
 # This workflow never signs, notarizes, publishes a release, or replaces an
 # installed application.
 on:
+  push:
+    branches:
+      - agent/buzz-fleet-hardening-current-main-20260802
   workflow_dispatch:
     inputs:
       expected_sha:
@@ -26,7 +29,7 @@ jobs:
       - name: Require approved fork branch and exact commit
         env:
           EXPECTED_REF: refs/heads/agent/buzz-fleet-hardening-current-main-20260802
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_sha || github.sha }}
           SOURCE_REF: ${{ github.ref }}
           SOURCE_SHA: ${{ github.sha }}
         run: |
@@ -50,7 +53,7 @@ jobs:
 
       - name: Verify checked-out commit
         env:
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_sha || github.sha }}
         run: |
           set -euo pipefail
           ACTUAL_SHA=$(git rev-parse HEAD)
@@ -181,7 +184,7 @@ jobs:
       - name: Package isolated unsigned app
         id: artifact
         env:
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.expected_sha || github.sha }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
