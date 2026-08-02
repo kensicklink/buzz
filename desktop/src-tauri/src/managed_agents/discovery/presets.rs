@@ -114,7 +114,7 @@ pub(super) const PRESET_HARNESSES: &[PresetHarness] = &[
         id: "grok",
         label: "Grok Build",
         command: "grok",
-        args: &["agent", "--always-approve", "stdio"],
+        args: &["agent", "stdio"],
         install_instructions_url: "https://build.x.ai/docs",
         install_hint: "Buzz talks to Grok Build through its CLI's agent stdio mode.",
         underlying_cli: None,
@@ -268,6 +268,39 @@ mod tests {
         assert_eq!(entry.default_args, vec!["acp"]);
         assert_eq!(entry.install_instructions_url, "https://docs.devin.ai/cli");
         assert_eq!(entry.source, HarnessSource::Preset);
+    }
+
+    #[test]
+    fn kimi_preset_stays_native_subscription_first_acp() {
+        let kimi = PRESET_HARNESSES
+            .iter()
+            .find(|preset| preset.id == "kimi")
+            .expect("Kimi preset should be present");
+        assert_eq!(kimi.command, "kimi");
+        assert_eq!(kimi.args, &["acp"]);
+
+        let entry = preset_catalog_entry(kimi, |_| None);
+        assert_eq!(entry.default_args, vec!["acp".to_string()]);
+    }
+
+    #[test]
+    fn grok_preset_preserves_stdio_without_approval_bypass() {
+        let grok = PRESET_HARNESSES
+            .iter()
+            .find(|preset| preset.id == "grok")
+            .expect("Grok preset should be present");
+        assert_eq!(grok.command, "grok");
+        assert_eq!(grok.args, &["agent", "stdio"]);
+        assert!(
+            !grok.args.iter().any(|arg| arg.contains("approve")),
+            "Grok preset must not include unconditional approval-bypass args"
+        );
+
+        let entry = preset_catalog_entry(grok, |_| None);
+        assert_eq!(
+            entry.default_args,
+            vec!["agent".to_string(), "stdio".to_string()]
+        );
     }
 
     #[test]

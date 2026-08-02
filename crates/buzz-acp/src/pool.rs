@@ -31,7 +31,8 @@ use uuid::Uuid;
 
 use crate::acp::{
     extract_model_config_options, extract_model_state, model_in_catalog,
-    resolve_model_switch_method, AcpClient, AcpError, McpServer, ModelSwitchMethod, StopReason,
+    resolve_model_switch_method, AcpClient, AcpError, AcpPromptCompletion, McpServer,
+    ModelSwitchMethod, StopReason,
 };
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -39,7 +40,7 @@ use crate::queue::{
     CancelReason, ContextMessage, ConversationContext, FlushBatch, PromptChannelInfo,
     PromptProfile, PromptProfileLookup, ThreadTags,
 };
-use crate::relay::{ChannelInfo, RestClient};
+use crate::relay::{ChannelInfo, RelayEventPublisher, RestClient};
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -524,6 +525,8 @@ pub struct PromptContext {
     pub cwd: String,
     /// REST client for pre-prompt context fetches (thread/DM history).
     pub rest_client: RestClient,
+    /// Signed relay event publisher for completion fallback messages.
+    pub relay_publisher: RelayEventPublisher,
     /// Shared channel metadata for startup-known and dynamically joined channels.
     pub channel_info: ChannelInfoResolver,
     /// Max messages to include in thread/DM context. 0 = disabled.
@@ -2065,6 +2068,14 @@ pub async fn run_prompt_task(
                             Some(buzz_core::agent_turn_metric::StopReason::EndTurn),
                         )
                         .await;
+                        let completion = agent.acp.take_prompt_completion();
+                        publish_completion_fallback_if_needed(
+                            &ctx,
+                            &source,
+                            batch.as_ref(),
+                            &completion,
+                        )
+                        .await;
                         send_prompt_result(
                             &result_tx,
                             &turn_id,
@@ -2127,6 +2138,8 @@ pub async fn run_prompt_task(
                 Some(core_stop),
             )
             .await;
+            let completion = agent.acp.take_prompt_completion();
+            publish_completion_fallback_if_needed(&ctx, &source, batch.as_ref(), &completion).await;
 
             send_prompt_result(
                 &result_tx,
@@ -3274,6 +3287,89 @@ fn requeue_cancelled_batch(
     })
 }
 
+async fn publish_completion_fallback_if_needed(
+    ctx: &PromptContext,
+    source: &PromptSource,
+    batch: Option<&FlushBatch>,
+    completion: &AcpPromptCompletion,
+) -> bool {
+    if completion.explicit_buzz_send_completed {
+        return false;
+    }
+    let Some(content) = completion.final_answer.as_deref() else {
+        return false;
+    };
+    let PromptSource::Channel(channel_id) = source else {
+        return false;
+    };
+    let Some(batch) = batch else {
+        return false;
+    };
+    publish_completion_fallback(
+        &ctx.relay_publisher,
+        &ctx.agent_keys,
+        *channel_id,
+        batch,
+        content,
+    )
+    .await
+}
+
+async fn publish_completion_fallback(
+    publisher: &RelayEventPublisher,
+    keys: &nostr::Keys,
+    channel_id: Uuid,
+    batch: &FlushBatch,
+    content: &str,
+) -> bool {
+    let thread_ref = completion_fallback_thread_ref(batch);
+    let builder =
+        match buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[]) {
+            Ok(builder) => builder,
+            Err(error) => {
+                tracing::warn!(channel = %channel_id, "completion fallback: build failed: {error}");
+                return false;
+            }
+        };
+    let event = match builder.sign_with_keys(keys) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::warn!(channel = %channel_id, "completion fallback: sign failed: {error}");
+            return false;
+        }
+    };
+    match publisher.publish_event(event).await {
+        Ok(()) => {
+            tracing::info!(channel = %channel_id, "completion fallback published");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(channel = %channel_id, "completion fallback publish failed: {error}");
+            false
+        }
+    }
+}
+
+fn completion_fallback_thread_ref(batch: &FlushBatch) -> Option<buzz_sdk::ThreadRef> {
+    let last_event = batch.events.last()?;
+    let trigger_id = last_event.event.id;
+    let tags = crate::queue::parse_thread_tags(&last_event.event);
+    let root_id = tags
+        .root_event_id
+        .as_deref()
+        .and_then(|root| nostr::EventId::from_hex(root).ok())
+        .unwrap_or(trigger_id);
+    let parent_id = tags
+        .parent_event_id
+        .as_deref()
+        .and_then(|parent| nostr::EventId::from_hex(parent).ok())
+        .unwrap_or(root_id);
+    Some(buzz_sdk::ThreadRef {
+        root_event_id: root_id,
+        parent_event_id: parent_id,
+    })
+}
+
 /// Result of classifying a failed [`AcpClient::cancel_with_cleanup_grace`]
 /// call: the [`PromptOutcome`] to report and the triggering batch's fate,
 /// decided together so tests cross the exact error→outcome→batch-fate
@@ -3972,6 +4068,7 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::queue::BatchEvent;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
 
@@ -5346,8 +5443,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_requeue_cancelled_batch_maps_control_signal_to_cancel_reason() {
+    #[tokio::test]
+    async fn test_requeue_cancelled_batch_maps_control_signal_to_cancel_reason() {
         let cases = [
             (ControlSignal::Steer, Some(CancelReason::Steer)),
             (ControlSignal::Interrupt, Some(CancelReason::Interrupt)),
@@ -5410,8 +5507,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_classify_control_cancel_failure_crosses_error_outcome_and_batch_fate() {
+    #[tokio::test]
+    async fn test_classify_control_cancel_failure_crosses_error_outcome_and_batch_fate() {
         let ctx = {
             let mut ctx = make_prompt_context_no_owner();
             ctx.dedup_mode = DedupMode::Queue;
@@ -5981,6 +6078,159 @@ mod tests {
         // Reaching here without a panic is the test.
     }
 
+    #[tokio::test]
+    async fn completion_fallback_publishes_one_signed_threaded_kind9() {
+        let agent_keys = Keys::generate();
+        let source_keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let root = EventBuilder::new(Kind::Custom(9), "root")
+            .sign_with_keys(&source_keys)
+            .unwrap();
+        let parent = EventBuilder::new(Kind::Custom(9), "parent")
+            .sign_with_keys(&source_keys)
+            .unwrap();
+        let h_tag = Tag::parse(["h", &channel_id.to_string()]).unwrap();
+        let root_tag = Tag::parse(["e", &root.id.to_hex(), "", "root"]).unwrap();
+        let parent_tag = Tag::parse(["e", &parent.id.to_hex(), "", "reply"]).unwrap();
+        let trigger = EventBuilder::new(Kind::Custom(9), "request")
+            .tags([h_tag, root_tag, parent_tag])
+            .sign_with_keys(&source_keys)
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event: trigger,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (publisher, mut published_rx) = RelayEventPublisher::test_pair();
+
+        assert!(
+            publish_completion_fallback(
+                &publisher,
+                &agent_keys,
+                channel_id,
+                &batch,
+                "final answer",
+            )
+            .await,
+            "fallback publish should queue a signed event through the relay publisher"
+        );
+
+        let event = published_rx.recv().await.expect("published fallback event");
+        assert_eq!(event.kind, Kind::Custom(9));
+        assert_eq!(event.content, "final answer");
+        assert_eq!(event.pubkey, agent_keys.public_key());
+        event.verify().expect("fallback event must verify");
+        let tags: Vec<Vec<String>> = event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect();
+        let channel_id_str = channel_id.to_string();
+        assert!(tags
+            .iter()
+            .any(|tag| tag.first().map(String::as_str) == Some("h")
+                && tag.get(1).map(String::as_str) == Some(channel_id_str.as_str())));
+        assert!(tags.iter().any(|tag| tag.len() >= 4
+            && tag[0] == "e"
+            && tag[1] == root.id.to_hex()
+            && tag[3] == "root"));
+        assert!(tags.iter().any(|tag| tag.len() >= 4
+            && tag[0] == "e"
+            && tag[1] == parent.id.to_hex()
+            && tag[3] == "reply"));
+        assert!(
+            published_rx.try_recv().is_err(),
+            "completion fallback must publish exactly one event"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_explicit_send_suppresses_fallback_without_relay_echo() {
+        let agent_keys = Keys::generate();
+        let source_keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let trigger = EventBuilder::new(Kind::Custom(9), "request")
+            .tags([Tag::parse(["h", &channel_id.to_string()]).unwrap()])
+            .sign_with_keys(&source_keys)
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event: trigger,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (publisher, mut published_rx) = RelayEventPublisher::test_pair();
+        let ctx = make_prompt_context_impl_with_publisher(&agent_keys, None, publisher);
+        let completion = AcpPromptCompletion {
+            final_answer: Some("already sent".into()),
+            explicit_buzz_send_completed: true,
+        };
+
+        assert!(
+            !publish_completion_fallback_if_needed(
+                &ctx,
+                &PromptSource::Channel(channel_id),
+                Some(&batch),
+                &completion,
+            )
+            .await,
+            "completed explicit send must suppress fallback before any relay echo is observed"
+        );
+        assert!(
+            published_rx.try_recv().is_err(),
+            "suppressed fallback must not queue a relay event"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_anchors_top_level_completion_to_triggering_event() {
+        let agent_keys = Keys::generate();
+        let source_keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let trigger = EventBuilder::new(Kind::Custom(9), "top-level request")
+            .tags([Tag::parse(["h", &channel_id.to_string()]).unwrap()])
+            .sign_with_keys(&source_keys)
+            .unwrap();
+        let trigger_id = trigger.id.to_hex();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event: trigger,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (publisher, mut published_rx) = RelayEventPublisher::test_pair();
+
+        assert!(
+            publish_completion_fallback(&publisher, &agent_keys, channel_id, &batch, "answer")
+                .await
+        );
+        let event = published_rx.recv().await.expect("published fallback event");
+        let tags: Vec<Vec<String>> = event
+            .tags
+            .iter()
+            .map(|tag| tag.as_slice().to_vec())
+            .collect();
+        let e_tags: Vec<&Vec<String>> = tags.iter().filter(|tag| tag[0] == "e").collect();
+        assert_eq!(e_tags.len(), 1, "top-level fallback must emit one e tag");
+        assert!(e_tags
+            .iter()
+            .any(|tag| tag.len() >= 4 && tag[1] == trigger_id && tag[3] == "reply"));
+        assert!(!e_tags.iter().any(|tag| tag.len() >= 4 && tag[3] == "root"));
+    }
+
     // ── NIP-AM emit-hook unit tests ────────────────────────────────────────
 
     /// `acp_stop_to_core` maps all ACP stop reasons to the correct NIP-AM
@@ -6376,6 +6626,15 @@ mod tests {
         agent_keys: &nostr::Keys,
         owner_pubkey: Option<nostr::PublicKey>,
     ) -> PromptContext {
+        let (relay_publisher, _relay_rx) = RelayEventPublisher::test_pair();
+        make_prompt_context_impl_with_publisher(agent_keys, owner_pubkey, relay_publisher)
+    }
+
+    fn make_prompt_context_impl_with_publisher(
+        agent_keys: &nostr::Keys,
+        owner_pubkey: Option<nostr::PublicKey>,
+        relay_publisher: RelayEventPublisher,
+    ) -> PromptContext {
         use crate::relay::RestClient;
         PromptContext {
             mcp_servers: vec![],
@@ -6396,6 +6655,7 @@ mod tests {
                 keys: agent_keys.clone(),
                 auth_tag_json: None,
             },
+            relay_publisher,
             channel_info: ChannelInfoResolver::new(
                 std::collections::HashMap::new(),
                 RestClient {

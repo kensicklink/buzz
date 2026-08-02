@@ -614,7 +614,11 @@ fn claude_spawn_uses_the_probed_cli_executable() {
     std::env::set_var("PATH", temp.path());
 
     let mut command = std::process::Command::new("buzz-acp");
-    super::configure_runtime_cli(&mut command, super::known_acp_runtime("claude-agent-acp"));
+    super::configure_runtime_cli(
+        &mut command,
+        super::known_acp_runtime("claude-agent-acp"),
+        false,
+    );
 
     if let Some(path) = original_path {
         std::env::set_var("PATH", path);
@@ -627,9 +631,45 @@ fn claude_spawn_uses_the_probed_cli_executable() {
 }
 
 #[test]
+fn claude_descriptor_executable_wins_over_auto_discovery() {
+    let _guard = crate::managed_agents::lock_path_mutex();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let discovered = temp
+        .path()
+        .join(format!("claude{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&discovered, "").expect("write fake discovered cli");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&discovered, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake discovered cli executable");
+    }
+    let original_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", temp.path());
+
+    let explicit = std::path::Path::new("/custom/claude");
+    let mut command = std::process::Command::new("buzz-acp");
+    command.env("CLAUDE_CODE_EXECUTABLE", explicit);
+    super::configure_runtime_cli(
+        &mut command,
+        super::known_acp_runtime("claude-agent-acp"),
+        true,
+    );
+
+    if let Some(path) = original_path {
+        std::env::set_var("PATH", path);
+    } else {
+        std::env::remove_var("PATH");
+    }
+    assert!(command.get_envs().any(|(key, value)| {
+        key == "CLAUDE_CODE_EXECUTABLE" && value == Some(explicit.as_os_str())
+    }));
+}
+
+#[test]
 fn codex_spawn_does_not_set_a_claude_executable() {
     let mut command = std::process::Command::new("buzz-acp");
-    super::configure_runtime_cli(&mut command, super::known_acp_runtime("codex-acp"));
+    super::configure_runtime_cli(&mut command, super::known_acp_runtime("codex-acp"), false);
     assert!(!command
         .get_envs()
         .any(|(key, _)| key == "CLAUDE_CODE_EXECUTABLE"));
