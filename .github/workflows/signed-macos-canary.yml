@@ -19,18 +19,45 @@ jobs:
       contents: read
       id-token: write # required by block/apple-codesign-action for OIDC
     steps:
-      - name: Require main
+      - name: Resolve approved source
+        id: source
         env:
           SOURCE_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          CANDIDATE_REF: refs/heads/agent/buzz-fleet-hardening-ringer-20260802
+          CANDIDATE_SHA: a6c41446558898ae79ea27205bb7b31bc11ab158
         run: |
-          if [[ "$SOURCE_REF" != "refs/heads/main" ]]; then
-            echo "::error::Signed canary builds must run from main; got $SOURCE_REF"
-            exit 1
-          fi
+          set -euo pipefail
+          case "$SOURCE_REF" in
+            "refs/heads/main")
+              TARGET_SHA="$WORKFLOW_SHA"
+              ;;
+            "$CANDIDATE_REF")
+              TARGET_SHA="$CANDIDATE_SHA"
+              ;;
+            *)
+              echo "::error::Signed canary builds must run from main or the approved candidate branch; got $SOURCE_REF"
+              exit 1
+              ;;
+          esac
+          echo "sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "Building approved source $TARGET_SHA for workflow ref $SOURCE_REF"
 
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+          ref: ${{ steps.source.outputs.sha }}
+
+      - name: Verify approved source
+        env:
+          EXPECTED_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Approved source mismatch: expected $EXPECTED_SHA, got $ACTUAL_SHA"
+            exit 1
+          fi
 
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
 
